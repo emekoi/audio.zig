@@ -4,170 +4,117 @@
 //  under the terms of the MIT license. See LICENSE for details.
 //
 
-// [~] const char* cm_get_error(void);
-// [x] void cm_init(int samplerate);
-// [~] void cm_set_lock(cm_EventHandler lock);
-// [x] void cm_set_master_gain(double gain);
-// [ ] void cm_process(cm_Int16 *dst, int len);
-// [ ] cm_Source* cm_new_source(const cm_SourceInfo *info);
-// [ ] cm_Source* cm_new_source_from_file(const char *filename);
-// [ ] cm_Source* cm_new_source_from_mem(void *data, int size);
-// [ ] void cm_destroy_source(cm_Source *src);
-// [ ] double cm_get_length(cm_Source *src);
-// [ ] double cm_get_position(cm_Source *src);
-// [ ] int cm_get_state(cm_Source *src);
-// [ ] void cm_set_gain(cm_Source *src, double gain);
-// [ ] void cm_set_pan(cm_Source *src, double pan);
-// [ ] void cm_set_pitch(cm_Source *src, double pitch);
-// [ ] void cm_set_loop(cm_Source *src, int loop);
-// [ ] void cm_play(cm_Source *src);
-// [ ] void cm_pause(cm_Source *src);
-// [ ] void cm_stop(cm_Source *src);
-
-
-
 const std = @import("std");
-const Mutex = std.Mutex;
-const ArrayList = std.ArrayList;
-const Allocator = std.mem.Allocator;
+const builtin = @import("builtin");
+const time = std.os.time;
 
-const math = std.math;
-pub const Player = @import("player/index.zig");
-
-const BUFFER_SIZE = 512;
-const BUFFER_MASK = BUFFER_SIZE - 1;
-
-const FX_BITS = 12;
-const FX_UNIT = 1 << FX_BITS;
-
-fn fxFromFloat(comptime T: type, f: T) isize {
-    return f * FX_UNIT;
-}
-
-fn fxLerp(comptime T: type, a: T, b: T, p: T) T {
-    return a + (((b - a) * p) >> FX_BITS);
-}
-
-fn clamp(comptime T: type, x: T, a: T, b: T) T {
-    const max = math.max(T, a, b);
-    const min = math.min(T, a, b);
-    if (x > max) {
-        return max;
-    } else if (x < min) {
-        return min;
-    } else {
-        return x;
-    }
-}
-
-pub const State = enum {
-    Stopped,
-    Playing,
-    Paused,
+const sys = switch (builtin.os) {
+    builtin.Os.windows => @import("windows/index.zig"),
+    else => @panic("unsupported OS"),
 };
 
-pub const EventHandler = fn(Event)!void;
-
-pub const Event = union(enum) {
-    Lock: void,
-    Unlock: void,
-    Rewind: void,
-    Destroy: void,
-    Samples: []const i16,
-};
-
-
-pub const SourceInfo = struct {
-    handler: EventHandler,
-    sample_rate: usize,
-    length: usize,
-};
-
-pub const Source = struct {
+pub const AudioMode = union(enum) {
     const Self = @This();
 
-    mixer: *Mixer,
-    next: ?*const Source,       // next source in list
-    buffer: [BUFFER_SIZE]i16,   // internal buffer with raw stereo pcm
-    handler: EventHandler,      // event handler
-    sample_rate: usize,         // stream's native samplerate
-    length: usize,              // stream's length in frames
-    end: usize,                 // end index for the current play-through
-    state: State,               // current state
-    position: i64,              // current playhead position (fixed point)
-    lgain, rgain: isize,        // left and right gain (fixed point)
-    rate: isize,                // playback rate (fixed point)
-    next_fill: isize,           // next frame idx where the buffer needs to be filled
-    loop: bool,                 // whether the source will loop when `end` is reached
-    rewind: bool,               // whether the source will rewind before playing
-    active: bool,               // whether the source is part of `sources` list
-    gain: f32,                  // gain set by `setGain()`
-    pan: f32,                   // pan set by `setPan()`
+    Mono: usize,
+    Stereo: usize,
 
-    fn new(mixer: *Mixer, info: SourceInfo) Self {
-        return undefined;
-    }
-
-    fn rewindSource(self: *Self) void {
-        self.handler(Event {
-            .Rewind = {},
-        });
-        self.position = 0;
-        self.rewind = false;
-        self.end = self.length;
-        self.next_fill = 0;
-    }
-
-    fn fillBuffer(self: *Self, offset: usize, length: usize) void {
-        const start = offset;
-        const end = start + length;
-        self.handler(Event {
-            .Samples = self.buffer[start..end],
-        });
-    }
-
-    fn process(self: *Self) void {
-        const dst = self.mixer.buffer;
-
-        // do rewind if flag is set
-        if (self.rewind) {
-            self.rewindSource();
-        }
-
-        // don't process if not playing
-        switch (self.state) {
-            State.Paused => return,
-            else => {},
-        }
-
-        // process audio
-        while (length > 0) {
-            // get current position frame
-            const frame = self.position >> FX_BITS;
-        }
+    pub fn channelCount(self: Self) usize {
+        return switch (self) {
+            AudioMode.Mono => usize(1),
+            AudioMode.Stereo => usize(2),
+        };
     }
 };
 
-
-pub const Mixer = struct {
+pub const Player = struct {
     const Self = @This();
 
-    lock: Mutex,                // mutex
-    sources: ArrayList(Source), // linked list of active sources
-    buffer: [BUFFER_SIZE]i32,   // internal master buffer
-    sample_rate: isize,         // master samplerate
-    gain: isize,                // master gain (fixed point)
+    pub const Error = sys.Player.Error;
 
-    pub fn init(allocator: *Allocator, sample_rate: isize) Self {
+    pub const OutStream = struct {
+        player: *Player,
+        stream: Stream,
+        
+        pub const Stream = std.io.OutStream(Error);
+
+        fn writeFn(out_stream: *Stream, bytes: []const u8) Error!void {
+            const self = @fieldParentPtr(OutStream, "stream", out_stream);
+            return self.player.write(bytes);
+        }
+    };
+
+    player: sys.Player,
+    pub sample_rate: usize,
+    mode: AudioMode,
+    buf_size: usize,
+
+    pub fn new(allocator: *std.mem.Allocator, sample_rate: usize, mode: AudioMode, buf_size: usize) !Self {
         return Self {
+            .player = try sys.Player.new(allocator, sample_rate, mode, buf_size),
             .sample_rate = sample_rate,
-            .lock = Mutex.init(),
-            .sources = ArrayList.init(allocator),
-            .gain = FX_UNIT,
+            .buf_size = buf_size,
+            .mode = mode,
         };
     }
 
-    pub fn setGain(self: *Self, gain: f32) void {
-        self.gain = fxFromFloat(f32, gain);
+    fn bytes_per_sec(self: Self) usize {
+        return self.sample_rate * switch (self.mode) {
+            AudioMode.Mono => |bps| bps * self.mode.channelCount(),
+            AudioMode.Stereo => |bps| bps * self.mode.channelCount(),
+        };
+    }
+
+    pub fn write(self: *Self, bytes: []const u8) Error!void {
+        var written: usize = 0;
+        var data = bytes;
+
+        while (data.len > 0) {
+            const n = try self.player.write(data);
+            written += n;
+
+            data = data[n..];
+
+            if (data.len > 0) {
+                time.sleep(time.ns_per_s * self.buf_size / self.bytes_per_sec() / 8);
+            }
+        }
+    }
+
+    pub fn close(self: *Self) !void {
+        time.sleep(time.ns_per_s * self.buf_size / self.bytes_per_sec());
+        try self.player.close();
+    }
+
+    pub fn outStream(self: *Player) OutStream {
+        return OutStream {
+            .player = self,
+            .stream = OutStream.Stream { .writeFn = OutStream.writeFn }
+        };
     }
 };
+
+test "Player -- raw audio" {
+    var direct_allocator = std.heap.DirectAllocator.init();
+    const alloc = &direct_allocator.allocator;
+    defer direct_allocator.deinit();
+    
+    const mode = AudioMode { .Stereo = 2 };
+    var player = try Player.new(alloc, 44100, mode, 2048);
+    var stream = player.outStream().stream;
+
+    var timer = try time.Timer.start();
+    const duration = time.ns_per_s * 5;
+    const dt = 1.0 / @intToFloat(f32, player.sample_rate);
+
+    while (timer.read() < duration) {
+        try player.write([]u8{127}**2048);
+        // var i: usize = 0;
+        // while (i < player.buf_size) : (i += 1) {
+        //     const p = @intToFloat(f32, i) / @intToFloat(f32, player.buf_size);
+        //     const out = std.math.sin(p * 2.0 * std.math.pi);
+        //     try stream.writeByte(@floatToInt(u8, out));
+        //     try stream.writeByte(@floatToInt(u8, out));
+        // }
+    }
+}

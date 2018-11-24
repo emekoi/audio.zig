@@ -5,5 +5,5 @@ a multi-platform sound library for [zig](https://ziglang.org/) based on [cmixer]
 ## TODO
 |           | windows | macosx  | linux   |
 |-----------|---------|---------|---------|
-| playback  | OK?     | planned | planned |
+| playback  | WIP     | planned | planned |
 | recording | planned | planned | planned |

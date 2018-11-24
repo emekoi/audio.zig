@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const windows = std.os.windows;
 
 const Buffer = @import("../buffer.zig").Buffer;
+const AudioMode = @import("../index.zig").AudioMode;
 const winnm = @import("winnm.zig");
 
 const Header = struct {
@@ -18,13 +19,13 @@ const Header = struct {
         InvalidLength,
     };
 
-    buffer: buffer.Buffer(u8),
+    buffer: Buffer(u8),
     wavehdr: winnm.WaveHdr,
 
     pub fn new(player: Player, buf_size: usize) !Self {
         var result: Self = undefined;
 
-        result.buffer = try buffer.Buffer(u8).initSize(player.allocator, buf_size);
+        result.buffer = try Buffer(u8).initSize(player.allocator, buf_size);
 
         result.wavehdr = winnm.WaveHdr {
             .lpData = result.buffer.ptr(),
@@ -38,22 +39,22 @@ const Header = struct {
         };
         
         try winnm.waveOutPrepareHeader(
-            plaer.handle, &result.wavehdr,
+            player.handle, &result.wavehdr,
            @sizeOf(winnm.WaveHdr)
         ).toError();
         
         return result;
     }
 
-    pub fn write(self: *Self, player: Player, data: []const u8) !void {
-        if (data.len != self.buffer.len) {
+    pub fn write(self: *Self, player: *const Player, data: []const u8) !void {
+        if (data.len != self.buffer.len()) {
             return error.InvalidLength;
         }
 
-        self.buffer.replaceContents(data);
+        try self.buffer.replaceContents(data);
 
         try winnm.waveOutWrite(
-            player.handle, &self.wavehd,
+            player.handle, &self.wavehdr,
             @intCast(windows.UINT, self.buffer.len())
         ).toError();
     }
@@ -71,20 +72,28 @@ pub const Player = struct {
     const Self = @This();
     const BUF_COUNT = 2;
 
+    pub const Error = Header.Error || Allocator.Error || winnm.MMError;
+
     allocator: *Allocator,
     handle: windows.HANDLE,
     headers: [BUF_COUNT]Header,
-    tmp: buffer.Buffer(u8),
+    tmp: Buffer(u8),
     buf_size: usize,
 
-    pub fn new(allocator: *Allocator, sample_rate: usize, channel_count: usize, bps: usize, buf_size: usize) !Self {
+    pub fn new(allocator: *Allocator, sample_rate: usize, mode: AudioMode, buf_size: usize) Error!Self {
         var result: Self = undefined;
         var handle: windows.HANDLE = undefined;
 
-        const block_align = channel_count * bps;
+        const bps = switch (mode) {
+            AudioMode.Mono => |bps| bps,
+            AudioMode.Stereo => |bps| bps,
+        };
+
+        const block_align = bps * mode.channelCount();
+
         const format = winnm.WaveFormatEx {
             .wFormatTag = winnm.WAVE_FORMAT_PCM,
-            .nChannels = @intCast(windows.WORD, channel_count),
+            .nChannels = @intCast(windows.WORD, mode.channelCount()),
             .nSamplesPerSec = @intCast(windows.DWORD, sample_rate),
             .nAvgBytesPerSec = @intCast(windows.DWORD, sample_rate * block_align),
             .nBlockAlign = @intCast(windows.WORD, block_align),
@@ -94,7 +103,7 @@ pub const Player = struct {
 
         try winnm.waveOutOpen(
             &handle, winnm.WAVE_MAPPER, &format,
-            null, null, winnm.CALLBACK_NULL
+            0, 0, winnm.CALLBACK_NULL
         ).toError();
 
         result = Self {
@@ -112,33 +121,30 @@ pub const Player = struct {
         return result;
     }
 
-    pub fn write(self: *Self, data: []u8) !void {
-        const n = min(data.len, max(0, self.buf_size - self.tmp.len()));
-        self.tmp.append(data[0..n]);
+    pub fn write(self: *Self, data: []const u8) Error!usize {
+        const n = std.math.min(data.len, std.math.max(0, self.buf_size - self.tmp.len()));
+        try self.tmp.append(data[0..n]);
         if (self.tmp.len() < self.buf_size) {
-            return;
+            return n;
         }
 
-        const header = for (self.headers) |*header| {
+        var header = for (self.headers) |header| {
             if (header.wavehdr.dwFlags & winnm.WHDR_INQUEUE == 0) {
                 break header;
             }
-        } else return;
+        } else return n;
 
         try header.write(self, self.tmp.toSlice());
-
         try self.tmp.resize(0);
 
-        return;
+        return n;
     }
 
-    pub fn close(self: *Self) !void {
+    pub fn close(self: *Self) Error!void {
         for (self.headers) |*header| {
             try header.destroy(self.handle);
         }
-
         try winnm.waveOutClose(self.handle).toError();
-
         self.tmp.deinit();
     }
 };

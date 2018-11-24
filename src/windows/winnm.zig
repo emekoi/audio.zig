@@ -4,7 +4,6 @@
 //  under the terms of the MIT license. See LICENSE for details.
 //
 
-const MMRESULT = @import("errors.zig").MMRESULT;
 const windows = @import("std").os.windows;
 
 pub const WAVE_FORMAT_PCM = 0x01;
@@ -80,8 +79,8 @@ pub const WaveFormatEx = extern struct {
 
 
 pub extern "winmm" stdcallcc fn waveOutOpen(phwo: *windows.HANDLE, uDeviceID: UINT_PTR,
-    pwfx: *const WaveFormatEx, dwCallback: ?windows.DWORD_PTR,
-    dwCallbackInstance: ?windows.DWORD_PTR, fdwOpen: windows.DWORD) MMRESULT;
+    pwfx: *const WaveFormatEx, dwCallback: windows.DWORD_PTR,
+    dwCallbackInstance: windows.DWORD_PTR, fdwOpen: windows.DWORD) MMRESULT;
 
 pub extern "winmm" stdcallcc fn waveOutClose(hwo: windows.HANDLE) MMRESULT;
 
